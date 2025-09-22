@@ -34,7 +34,16 @@ use web_time::{Duration, Instant};
 /// Retry request error
 #[derive(Debug)]
 pub struct RetryError(Box<RetryErrorImpl>);
-
+impl RetryError{
+    pub fn status_code(&self) -> Option<StatusCode> {
+        match self.0.inner {
+            RequestError::Status { status, .. } | RequestError::Response { status, .. } => {
+                Some(status)
+            },
+            _ => return None,
+        }
+    }
+}
 /// Box error to avoid large error variant
 #[derive(Debug)]
 struct RetryErrorImpl {

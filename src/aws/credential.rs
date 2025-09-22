@@ -17,7 +17,7 @@
 
 use crate::aws::{AwsCredentialProvider, STORE, STRICT_ENCODE_SET, STRICT_PATH_ENCODE_SET};
 use crate::client::builder::HttpRequestBuilder;
-use crate::client::retry::RetryExt;
+use crate::client::retry::{RetryError, RetryExt};
 use crate::client::token::{TemporaryToken, TokenCache};
 use crate::client::{HttpClient, HttpError, HttpRequest, TokenProvider};
 use crate::util::{hex_digest, hex_encode, hmac_sha256};
@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use bytes::Buf;
 use chrono::{DateTime, Utc};
 use http::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
-use http::{Method, StatusCode};
+use http::{Method, StatusCode, response};
 use percent_encoding::utf8_percent_encode;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -507,7 +507,7 @@ impl TokenProvider for WebIdentityProvider {
         client: &HttpClient,
         retry: &RetryConfig,
     ) -> Result<TemporaryToken<Arc<AwsCredential>>> {
-        web_identity(
+        match web_identity(
             client,
             retry,
             &self.token_path,
@@ -515,11 +515,25 @@ impl TokenProvider for WebIdentityProvider {
             &self.session_name,
             &self.endpoint,
         )
-        .await
-        .map_err(|source| crate::Error::Generic {
-            store: STORE,
-            source,
-        })
+        .await{
+            Ok(token) => Ok(token),
+            Err(e) => {
+                match e.status_code(){
+                    Some(StatusCode::FORBIDDEN)=> {
+                        tracing::error!("WebIdentityProvider: Access denied, check role_arn and token_path");
+                        Err(crate::Error::PermissionDenied { path: self.endpoint.to_owned(), source: Box::new(e) })
+                    },
+                    Some(StatusCode::UNAUTHORIZED) => {
+                        tracing::error!("WebIdentityProvider: Unauthenticated, check role_arn and token_path");
+                        Err(crate::Error::Unauthenticated { path: self.endpoint.to_owned(), source: Box::new(e) })
+                    },
+                    _ => Err(crate::Error::Generic {
+                        store: STORE,
+                        source: Box::new(e),
+                    }),
+                }
+            }
+        }
     }
 }
 
@@ -636,7 +650,25 @@ impl From<SessionCredentials> for AwsCredential {
         }
     }
 }
-
+#[derive(Debug, thiserror::Error)]
+enum AssumeRoleError {
+    #[error("Error Performing AssumeRoleWithWebIdentity request: {0}")]
+    RetryError(#[from] RetryError),
+    #[error("Failed to Read Token File: {0}")]
+    ReadTokenFile(std::io::Error),
+    #[error(transparent)]
+    HttpError(#[from] HttpError),
+    #[error(transparent)]
+    XmlError(#[from] quick_xml::DeError),
+}
+impl AssumeRoleError{
+    fn status_code(&self) -> Option<StatusCode> {
+        match self {
+            AssumeRoleError::RetryError(e) => e.status_code(),
+            _ => None,
+        }
+    }
+}
 /// <https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts-technical-overview.html>
 async fn web_identity(
     client: &HttpClient,
@@ -645,11 +677,11 @@ async fn web_identity(
     role_arn: &str,
     session_name: &str,
     endpoint: &str,
-) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
+) -> Result<TemporaryToken<Arc<AwsCredential>>, AssumeRoleError> {
     let token = std::fs::read_to_string(token_path)
-        .map_err(|e| format!("Failed to read token file '{token_path}': {e}"))?;
+        .map_err(AssumeRoleError::ReadTokenFile)?;
 
-    let bytes = client
+    let response = client
         .post(endpoint)
         .query(&[
             ("Action", "AssumeRoleWithWebIdentity"),
@@ -663,13 +695,15 @@ async fn web_identity(
         .idempotent(true)
         .sensitive(true)
         .send()
-        .await?
+        .await?;
+    tracing::debug!("AssumeRoleWithWebIdentity response Succeeded");
+
+    let bytes= response
         .into_body()
         .bytes()
         .await?;
 
-    let resp: AssumeRoleResponse = quick_xml::de::from_reader(bytes.reader())
-        .map_err(|e| format!("Invalid AssumeRoleWithWebIdentity response: {e}"))?;
+    let resp: AssumeRoleResponse = quick_xml::de::from_reader(bytes.reader())?;
 
     let creds = resp.assume_role_with_web_identity_result.credentials;
     let now = Utc::now();
